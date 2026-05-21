@@ -1,0 +1,60 @@
+{
+    "name": "hikuroshi/rate-budget",
+    "description": "Provider-agnostic, storage-agnostic budget and rate limiting primitives for requests, tokens, quotas, cooldowns, and retries.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "rate-limit",
+        "rate-limiter",
+        "rate-budget",
+        "quota",
+        "throttle",
+        "retry",
+        "token-budget",
+        "rpm",
+        "tpm",
+        "rpd",
+        "cooldown"
+    ],
+    "homepage": "https://github.com/hikuroshi/rate-budget",
+    "authors": [
+        {
+            "name": "Hikuroshi",
+            "role": "Developer"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/hikuroshi/rate-budget/issues",
+        "source": "https://github.com/hikuroshi/rate-budget"
+    },
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Hikuroshi\\RateBudget\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Hikuroshi\\RateBudget\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "check": [
+            "@composer validate --strict",
+            "@test"
+        ],
+        "test": "@php tests/run.php"
+    },
+    "archive": {
+        "exclude": [
+            "/tests",
+            "/.github",
+            "/.gitignore",
+            "/composer.lock"
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

@@ -1,0 +1,5 @@
+/rate-budget-js export-ignore
+/tests export-ignore
+/.github export-ignore
+/.gitignore export-ignore
+/composer.lock export-ignore
