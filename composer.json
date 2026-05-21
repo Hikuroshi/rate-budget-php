@@ -16,7 +16,7 @@
         "rpd",
         "cooldown"
     ],
-    "homepage": "https://github.com/hikuroshi/rate-budget",
+    "homepage": "https://github.com/hikuroshi/rate-budget-php",
     "authors": [
         {
             "name": "Hikuroshi",
@@ -24,8 +24,8 @@
         }
     ],
     "support": {
-        "issues": "https://github.com/hikuroshi/rate-budget/issues",
-        "source": "https://github.com/hikuroshi/rate-budget"
+        "issues": "https://github.com/hikuroshi/rate-budget-php/issues",
+        "source": "https://github.com/hikuroshi/rate-budget-php"
     },
     "require": {
         "php": ">=8.1"
