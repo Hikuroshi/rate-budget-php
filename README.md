@@ -1,403 +1,312 @@
 # hikuroshi/rate-budget
 
-`hikuroshi/rate-budget` is a small, dependency-free Composer package for
-calculating request rate limits, quota thresholds, token or cost budgets,
-cooldowns, and retries.
+A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.
 
-It is provider-agnostic and storage-agnostic. The package does not manage your
-database, Redis keys, queues, locks, or HTTP clients. Your application owns the
-state; `hikuroshi/rate-budget` only calculates deterministic decisions from the
-counters and events you pass in.
+`hikuroshi/rate-budget` selects an active key within a scope such as a tenant,
+workspace, project, user, or guild. Each key has independent RPM, TPM, and RPD
+limits, so your application can safely move to another key when one key is
+cooling down, under token pressure, or near its daily quota.
 
-## Requirements
+The package is lightweight, dependency-free, and storage adapter friendly. Your
+application owns the state; `hikuroshi/rate-budget` only computes quota
+decisions and records reservations through the configured adapter.
 
-- PHP 8.1 or newer
-- Composer
-- No runtime dependencies
-
-## Installation
+## Install
 
 ```bash
 composer require hikuroshi/rate-budget
 ```
 
-## Features
+## Core Algorithm
 
-- Request spacing for limits such as RPM, RPH, or any count-per-window limit.
-- Sliding-window cost checks for tokens, bytes, credits, points, or custom units.
-- Daily quota thresholds such as RPD with configurable safety percentages.
-- Per-request token or cost budget planning.
-- Flexible budget splitting for context, input, output, metadata, and similar allocations.
-- Pure actor cooldown helper for Redis, database, cache, or custom storage.
-- Lightweight in-memory actor cooldowns for single-process use cases.
-- Retry helper with configurable status codes, message fragments, and delays.
-- Small immutable result objects with `toArray()` helpers.
-- PSR-4 autoloading.
-- Zero runtime dependencies.
+RPM: spacing-based cooldown.
 
-## Imports
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\Budget;
-use Hikuroshi\RateBudget\Cooldown;
-use Hikuroshi\RateBudget\Limit;
-use Hikuroshi\RateBudget\MemoryCooldown;
-use Hikuroshi\RateBudget\Retry;
-use Hikuroshi\RateBudget\WindowEntry;
+```txt
+cooldownMs = ceil(60000 / rpm) + bufferMs
 ```
 
-## Core Model
+TPM: sliding 60-second token window.
 
-`hikuroshi/rate-budget` is designed around pure calculations:
+```txt
+usedTokensLast60s + estimatedRequestTokens <= tpmLimit
+```
 
-1. Read current usage and recent events from your own storage.
-2. Pass those values into `hikuroshi/rate-budget`.
-3. If the decision requires waiting, delay, reject, or enqueue in your application.
-4. If the request is allowed, reserve or log the request atomically.
-5. After the request finishes, update usage in your storage.
+RPD: daily threshold guard.
 
-This keeps the package lightweight while still fitting distributed systems,
-serverless applications, workers, bots, API gateways, and cron jobs.
+```txt
+dailyCap = ceil(rpdLimit * thresholdPct / 100)
+```
 
-Time values are in milliseconds. Timestamps can be `DateTimeInterface`, Unix
-milliseconds, numeric strings, date strings, or `null` depending on the method.
+## Quick Start
 
-## RPM, TPM, and RPD Example
+Use a single key when you do not need key rotation yet.
 
 ```php
 <?php
 
-use Hikuroshi\RateBudget\Limit;
+use Hikuroshi\RateBudget\Quota;
 
-$profile = Limit::profile(
-    rpm: 15,
-    tpm: 250_000,
-    rpd: 500,
-    options: [
-        'dailyPercent' => 90,
-    ],
-);
+$quota = new Quota();
+$key = ['id' => 'key-a', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500];
 
-$daily = Limit::count(
-    used: $usageToday['request_count'],
-    limit: $profile->rpd,
-    percent: $profile->dailyPercent,
-);
+$reserved = $quota->reserve('scope:123', $key, ['tokens' => 800]);
 
-if (! $daily->allowed) {
-    throw new RuntimeException('Daily quota threshold reached.');
+if (! $reserved->ok) {
+    throw new RuntimeException("Quota blocked: {$reserved->reason}");
 }
 
-$cooldownMs = Limit::wait(
-    lastAt: $lastApiRequest['created_at'] ?? null,
-    cooldownMs: $profile->cooldownMs,
-);
+try {
+    $response = callProvider($reserved->key);
 
-$tokenMs = Limit::windowWait(
-    incoming: $estimatedRequestTokens,
-    limit: $profile->tpm,
-    entries: array_map(
-        static fn (array $request): array => [
-            'at' => $request['created_at'],
-            'cost' => $request['total_tokens'],
-        ],
-        $recentApiRequests,
-    ),
-);
+    $quota->commit($reserved->hold, [
+        'tokens' => $response->usage->totalTokens,
+    ]);
+} catch (Throwable $error) {
+    $quota->rollback($reserved->hold);
 
-$waitMs = max($cooldownMs, $tokenMs);
-
-if ($waitMs > 0) {
-    // Sleep, queue, reject, or reschedule in your application.
+    throw $error;
 }
 ```
 
-## Sliding-Window Cost Limit
-
-Use `Limit::window()` when you need the full decision, or
-`Limit::windowWait()` when you only need the wait time.
+Use multiple keys with priority when you want automatic key rotation.
 
 ```php
 <?php
 
-use Hikuroshi\RateBudget\Limit;
+use Hikuroshi\RateBudget\Quota;
 
-$now = strtotime('2026-05-21 14:00:40') * 1000;
-$decision = Limit::window(
-    incoming: 500,
+$quota = new Quota(['thresholdPct' => 90]);
+
+$keys = [
+    ['id' => 'key-a', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500, 'priority' => 10],
+    ['id' => 'key-b', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500, 'priority' => 5],
+];
+
+$reserved = $quota->reserve('tenant:acme', $keys, ['tokens' => 2_400]);
+
+if (! $reserved->ok) {
+    if ($reserved->waitMs !== null) {
+        queueForLater($reserved->waitMs);
+        return;
+    }
+
+    throw new RuntimeException("No quota key available: {$reserved->reason}");
+}
+
+$response = callProvider($reserved->key);
+
+$quota->commit($reserved->hold, [
+    'tokens' => $response->usage->totalTokens,
+]);
+```
+
+## API
+
+### `new Quota($options = [])`
+
+```php
+use Hikuroshi\RateBudget\MemoryStore;
+use Hikuroshi\RateBudget\Quota;
+
+$quota = new Quota([
+    'store' => new MemoryStore(),
+    'estimate' => static fn (array $req): int => $req['inputTokens'] + $req['maxOutputTokens'],
+    'windowMs' => 60_000,
+    'bufferMs' => 1_000,
+    'thresholdPct' => 90,
+]);
+```
+
+Constructor options:
+
+- `store`: custom storage adapter. Defaults to `MemoryStore`.
+- `estimate($req)`: token estimator. Defaults to `$req['tokens']`, numeric request, object `tokens`, or `1`.
+- `now()`: custom clock returning Unix milliseconds.
+- `id()`: reservation id generator.
+- `windowMs`: token window. Defaults to `60000`.
+- `bufferMs`: RPM/TPM safety buffer. Defaults to `1000`.
+- `thresholdPct`: RPD threshold percent. Defaults to `100`.
+- `dayKey($now)`: daily bucket key. Defaults to UTC `YYYY-MM-DD`.
+- `resetAt($now)`: timestamp for the next daily reset. Defaults to next UTC day.
+
+### `reserve($scope, $keyOrKeys, $req = null)`
+
+Selects the best key and immediately creates a reservation for RPM, TPM, and
+RPD accounting. `$keyOrKeys` can be a single key array/object or a list of keys.
+
+```php
+$single = $quota->reserve('tenant:acme', $key, ['tokens' => 1_500]);
+$result = $quota->reserve('tenant:acme', $keys, ['tokens' => 1_500]);
+```
+
+Successful result:
+
+```php
+$result->ok;      // true
+$result->key;     // selected key, preserving extra fields
+$result->hold;    // Hold object for commit/rollback
+$result->tokens;  // estimated tokens
+$result->waitMs;  // 0
+$result->checks;  // list<KeyCheck>
+```
+
+Blocked result:
+
+```php
+$result->ok;      // false
+$result->reason;  // "rpm", "tpm", "rpd", "off", or "no_key"
+$result->waitMs;  // int|null
+$result->tokens;  // estimated tokens
+$result->checks;  // list<KeyCheck>
+```
+
+`waitMs` is `null` when the request cannot be handled by any key, for example
+when the estimated token count is larger than every key's TPM limit.
+
+### `commit($hold, $usage = [])`
+
+Completes a reservation after the request has actually consumed provider quota.
+
+```php
+$quota->commit($reserved->hold, ['tokens' => $actualTokens]);
+```
+
+### `rollback($hold)`
+
+Cancels a reservation when a request was not sent or failed before provider
+quota was consumed.
+
+```php
+$quota->rollback($reserved->hold);
+```
+
+### `check($scope, $keyOrKeys, $req = null)`
+
+Runs a dry check to see which key would be selected without creating a
+reservation.
+
+```php
+$single = $quota->check('workspace:42', $key, ['tokens' => 800]);
+$decision = $quota->check('workspace:42', $keys, ['tokens' => 800]);
+```
+
+`check()` still touches storage to normalize scope/key state and prune old token
+hits, but it does not create a hold or consume quota.
+
+## Key Shape
+
+```php
+$key = [
+    'id' => 'key-a',
+    'rpm' => 15,
+    'tpm' => 250_000,
+    'rpd' => 500,
+    'priority' => 10,
+    'enabled' => true,
+];
+```
+
+Fields:
+
+- `id`: stable key id.
+- `rpm`: requests per minute.
+- `tpm`: tokens per minute.
+- `rpd`: requests per day.
+- `priority`: higher value is preferred. Defaults to `0`.
+- `enabled`: set `false` to skip a key. Defaults to `true`.
+
+Extra fields are preserved on the selected key, so you can attach provider
+names, encrypted key references, model names, or metadata.
+
+## Selection Rules
+
+1. Disabled keys are skipped.
+2. A key must pass RPD threshold, RPM cooldown, and TPM window checks.
+3. Among allowed keys, the highest `priority` wins.
+4. Ties prefer lower token pressure, then lower daily pressure, then key id.
+5. If no key is allowed, the result returns the shortest useful `waitMs`.
+
+## Storage Adapter
+
+`MemoryStore` is useful for one process. For multi-instance systems, implement
+`QuotaStore` with Redis, SQL, DynamoDB, Laravel cache with locks, or any
+transactional storage.
+
+```php
+<?php
+
+use Hikuroshi\RateBudget\QuotaStore;
+
+final class DatabaseQuotaStore implements QuotaStore
+{
+    public function mutate(string $scope, callable $fn): mixed
+    {
+        return DB::transaction(function () use ($scope, $fn) {
+            $state = DB::table('quota_states')
+                ->where('scope', $scope)
+                ->lockForUpdate()
+                ->value('state');
+
+            $state = $state ? json_decode($state, true) : ['keys' => []];
+            $result = $fn($state);
+
+            DB::table('quota_states')->updateOrInsert(
+                ['scope' => $scope],
+                ['state' => json_encode($state)]
+            );
+
+            return $result;
+        });
+    }
+}
+```
+
+The `mutate` callback must run atomically per scope. That keeps reservations
+safe when many workers route requests at the same time.
+
+## Helpers
+
+```php
+use const Hikuroshi\RateBudget\BUFFER_MS;
+use const Hikuroshi\RateBudget\THRESHOLD_PCT;
+use const Hikuroshi\RateBudget\WINDOW_MS;
+use function Hikuroshi\RateBudget\cooldownMs;
+use function Hikuroshi\RateBudget\dailyCap;
+use function Hikuroshi\RateBudget\tokenWaitMs;
+
+cooldownMs(rpm: 15);
+dailyCap(rpd: 500, thresholdPct: 90);
+tokenWaitMs(
+    used: 2_000,
+    tokens: 800,
     limit: 10_000,
-    entries: [
-        ['at' => $now - 30_000, 'cost' => 4_000],
-        ['at' => $now - 10_000, 'cost' => 6_200],
-    ],
-    options: [
-        'now' => $now,
-        'windowMs' => 60_000,
-        'bufferMs' => 1_000,
-    ],
-);
-
-if (! $decision->allowed && $decision->retryMs !== null) {
-    usleep($decision->retryMs * 1000);
-}
-```
-
-`cost` can represent tokens, weighted requests, bytes, credits, rows, points,
-or any other unit that should be limited over time.
-
-`Limit::window()` returns `WindowResult`:
-
-```php
-$decision->allowed; // bool
-$decision->reason;  // "within_limit", "single_request_exceeds_limit", or "window_exhausted"
-$decision->cost;    // projected cost after the incoming request
-$decision->limit;   // normalized limit
-$decision->retryMs; // int, 0, or null
-```
-
-## Count Quotas
-
-Use `Limit::count()` for daily, monthly, or fixed-period counters where your
-application already stores the current count.
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\Limit;
-
-$decision = Limit::count(
-    used: 450,
-    limit: 500,
-    percent: 90,
-);
-
-if (! $decision->allowed) {
-    throw new RuntimeException('Quota reached.');
-}
-
-echo $decision->left; // remaining requests before threshold
-```
-
-`Limit::count()` returns `CountResult`:
-
-```php
-$decision->allowed;   // bool
-$decision->used;      // normalized used count
-$decision->threshold; // calculated threshold count
-$decision->left;      // remaining count before threshold
-```
-
-## Token Budget Planning
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\Budget;
-
-$totalBudget = Budget::perRequest(
-    tokens: 250_000,
-    spacingMs: 5_000,
-    options: [
-        'min' => 96,
-    ],
-);
-
-$inputBudget = Budget::portion($totalBudget, 0.5);
-
-$flexible = Budget::split(
-    parent: $inputBudget,
-    available: $inputBudget - $systemPromptTokens - $userPromptTokens,
-    parts: [
-        ['name' => 'context', 'target' => 0.55, 'max' => 0.60],
-        ['name' => 'metadata', 'target' => 0.15, 'max' => 0.20],
-    ],
-);
-
-echo $flexible['context'];
-echo $flexible['metadata'];
-```
-
-`Budget::split()` first allocates each part up to its `target` ratio, then uses
-remaining budget up to each part's `max` ratio in order.
-
-## In-Memory Actor Cooldowns
-
-Use `MemoryCooldown` for local process cooldowns, such as UX cooldowns in a bot
-or a simple API server. For multi-instance systems, store the cooldown state in
-Redis, a database, Laravel cache, or another shared store and use the pure
-`Cooldown::consume()` helper instead.
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\MemoryCooldown;
-
-$limiter = new MemoryCooldown(
-    sameMs: 3_000,
-    diffMs: 1_000,
-    ttlMs: 5 * 60_000,
-);
-
-$decision = $limiter->consume(
-    scope: 'guild:123',
-    actor: 'user:456',
-);
-
-if (! $decision->allowed) {
-    echo "Retry after {$decision->retryMs}ms";
-}
-```
-
-`MemoryCooldown` keeps state in PHP memory only. State is lost when the process
-restarts and is not shared across workers.
-
-## Pure Actor Cooldowns
-
-Use `Cooldown::consume()` when your application owns the state.
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\Cooldown;
-
-$state = $cache->get('cooldown:guild:123');
-
-$decision = Cooldown::consume(
-    state: $state,
-    actor: 'user:456',
-    sameMs: 3_000,
-    diffMs: 1_000,
-);
-
-if (! $decision->allowed) {
-    return ['retry_after_ms' => $decision->retryMs];
-}
-
-$cache->set('cooldown:guild:123', $decision->state->toArray(), ttl: 300);
-```
-
-`Cooldown::consume()` accepts `CooldownState`, array state, or `null`. Array
-state can use short keys (`at`, `actor`) or JS-compatible keys
-(`lastAcceptedAt`, `lastActorId`).
-
-## Retry
-
-```php
-<?php
-
-use Hikuroshi\RateBudget\Retry;
-use Throwable;
-
-$response = Retry::run(
-    task: static fn (int $attempt) => fetchProvider(),
-    retries: 2,
-    delayMs: static fn (int $attempt, Throwable $error): int => 1_000 * ($attempt + 1),
-    shouldRetry: static fn (Throwable $error): bool => Retry::retryable($error, [
-        'codes' => [429, 500, 502, 503, 504],
-        'messages' => ['rate limit', 'temporarily unavailable'],
-    ]),
-    onRetry: static function (int $attempt, int $delayMs, Throwable $error): void {
-        error_log("Retry {$attempt} in {$delayMs}ms: {$error->getMessage()}");
-    },
+    hits: [['id' => 'hit-1', 'at' => time() * 1000, 'tokens' => 2_000]],
+    now: time() * 1000,
 );
 ```
 
-By default, `Retry::run()` retries errors with status codes `429`, `500`, and
-`503`. You can override retry behavior with `shouldRetry`.
+Exports:
 
-`Retry::status()` supports common exception shapes:
-
-- `getStatusCode()`
-- `getStatus()`
-- public `status`
-- public `statusCode`
-- throwable code
-- array keys `status` or `statusCode`
-
-## API Overview
-
-### `Limit`
-
-- `Limit::spacing($limit, $options = [])`: calculates safe request spacing inside a time window.
-- `Limit::inactiveSpacing($limit, $options = [])`: calculates inactive cooldown spacing with a multiplier.
-- `Limit::threshold($limit, $percent = 100)`: calculates a safe quota threshold.
-- `Limit::count($used, $limit, $percent = 100)`: evaluates count-based quota usage.
-- `Limit::wait($lastAt, $cooldownMs, $now = null)`: calculates remaining cooldown from the last accepted timestamp.
-- `Limit::window($incoming, $limit, $entries = [], $options = [])`: evaluates sliding-window cost usage.
-- `Limit::windowWait($incoming, $limit, $entries = [], $options = [])`: returns only the wait time for sliding-window cost usage.
-- `Limit::profile($rpm, $tpm, $rpd, $options = [])`: creates a normalized RPM, TPM, RPD, threshold, cooldown, and inactive cooldown profile.
-
-Supported `Limit` options:
-
-- `windowMs`: window length in milliseconds. Default: `60_000`.
-- `bufferMs`: safety buffer in milliseconds. Default: `1_000`.
-- `safetyBufferMs`: alias for `bufferMs`.
-- `dailyPercent`: daily threshold percentage for `profile()`.
-- `dailyThresholdPercent`: alias for `dailyPercent`.
-- `inactiveMultiplier`: inactive cooldown multiplier for `profile()`.
-- `inactiveCooldownMultiplier`: alias for `inactiveMultiplier`.
-- `current`: current cost override for `window()`.
-- `currentCost`: alias for `current`.
-- `sorted`: whether window entries are already sorted oldest first. Default: `true`.
-- `entriesSortedOldestFirst`: alias for `sorted`.
-- `now`: current timestamp in milliseconds for deterministic tests.
-
-### `Budget`
-
-- `Budget::perRequest($tokens, $spacingMs, $options = [])`: calculates cost or token budget per request.
-- `Budget::portion($total, $ratio)`: returns a ratio-based budget portion.
-- `Budget::split($parent, $available, $parts)`: allocates flexible budget across named partitions.
-
-Supported `Budget::perRequest()` options:
-
-- `windowMs`: window length in milliseconds. Default: `60_000`.
-- `min`: minimum per-request budget. Default: `1`.
-- `minimumTokens`: alias for `min`.
-
-### `Cooldown`
-
-- `Cooldown::consume($state, $actor, $sameMs, $diffMs, $now = null)`: evaluates and returns the next cooldown state.
-
-### `MemoryCooldown`
-
-- `new MemoryCooldown($sameMs, $diffMs, $ttlMs = 300_000, $cleanup = 256)`: creates an in-memory limiter.
-- `$limiter->consume($scope, $actor, $now = null)`: evaluates a scoped actor cooldown.
-- `$limiter->reset($scope = null)`: clears one scope or all scopes.
-- `$limiter->size()`: returns stored scope count.
-
-### `Retry`
-
-- `Retry::run($task, $retries, $delayMs = 0, $shouldRetry = null, $onRetry = null)`: retries a callable task.
-- `Retry::retryable($error, $options = [])`: checks status codes and message fragments.
-- `Retry::status($error)`: extracts an HTTP-like status code when possible.
-- `Retry::message($error)`: extracts an error message when possible.
-- `Retry::sleep($ms)`: sleeps for a millisecond duration.
-
-Supported `Retry::retryable()` options:
-
-- `codes`: retryable status codes. Default: `[429, 500, 503]`.
-- `statusCodes`: alias for `codes`.
-- `messages`: case-insensitive message fragments.
-- `messageIncludes`: alias for `messages`.
-
-## Result Objects
-
-All result objects expose public readonly properties and `toArray()`.
-
-- `LimitProfile`: `rpm`, `tpm`, `rpd`, `dailyPercent`, `dailyLimit`, `cooldownMs`, `inactiveMs`.
-- `CountResult`: `allowed`, `used`, `threshold`, `left`.
-- `WindowResult`: `allowed`, `reason`, `cost`, `limit`, `retryMs`.
-- `CooldownState`: `at`, `actor`.
-- `CooldownResult`: `allowed`, `state`, `retryMs`.
+- `WINDOW_MS`, `BUFFER_MS`, and `THRESHOLD_PCT` constants.
+- `cooldownMs()`
+- `dailyCap()`
+- `tokenWaitMs()`
+- `Defaults`: class wrapper for default constants.
+- `Limit::cooldownMs()`
+- `Limit::dailyCap()`
+- `Limit::tokenWaitMs()`
+- `Quota`
+- `QuotaManager`: alias for `Quota`.
+- `MemoryStore`
+- `QuotaStore`
+- `QuotaResult`
+- `KeyCheck`
+- `Hold`
 
 ## Build and Test
 
-From the package directory:
-
 ```bash
 composer dump-autoload
+composer check
 composer test
-composer validate --strict
 ```

@@ -2,11 +2,13 @@
 
 declare(strict_types=1);
 
-use Hikuroshi\RateBudget\Budget;
-use Hikuroshi\RateBudget\Cooldown;
 use Hikuroshi\RateBudget\Limit;
-use Hikuroshi\RateBudget\MemoryCooldown;
-use Hikuroshi\RateBudget\Retry;
+use Hikuroshi\RateBudget\MemoryStore;
+use Hikuroshi\RateBudget\Quota;
+use Hikuroshi\RateBudget\QuotaManager;
+use function Hikuroshi\RateBudget\cooldownMs;
+use function Hikuroshi\RateBudget\dailyCap;
+use function Hikuroshi\RateBudget\tokenWaitMs;
 
 require __DIR__ . '/../vendor/autoload.php';
 
@@ -19,57 +21,102 @@ function check(bool $ok, string $message): void
 
 $now = 1_700_000_000_000;
 
-check(Limit::spacing(60, ['windowMs' => 60_000, 'bufferMs' => 1_000]) === 2_000, 'Limit spacing failed.');
-
-$count = Limit::count(90, 100, 90);
-check(! $count->allowed && $count->left === 0 && $count->threshold === 90, 'Count limit failed.');
-
-$window = Limit::window(
-    incoming: 20,
-    limit: 100,
-    entries: [
-        ['at' => $now - 1_000, 'cost' => 90],
-    ],
-    options: ['now' => $now]
+check(Limit::cooldownMs(15) === 5_000, 'RPM cooldown failed.');
+check(Limit::dailyCap(500, 90) === 450, 'Daily cap failed.');
+check(cooldownMs(15) === 5_000, 'RPM cooldown function failed.');
+check(dailyCap(500, 90) === 450, 'Daily cap function failed.');
+check(
+    Limit::tokenWaitMs(
+        used: 90,
+        tokens: 20,
+        limit: 100,
+        hits: [['id' => 'h1', 'at' => $now - 1_000, 'tokens' => 90]],
+        now: $now
+    ) === 60_000,
+    'Token wait failed.'
 );
-check(! $window->allowed && $window->reason === 'window_exhausted' && $window->retryMs === 60_000, 'Window usage failed.');
+check(
+    tokenWaitMs(
+        used: 90,
+        tokens: 20,
+        limit: 100,
+        hits: [['id' => 'h1', 'at' => $now - 1_000, 'tokens' => 90]],
+        now: $now
+    ) === 60_000,
+    'Token wait function failed.'
+);
+check(
+    Limit::tokenWaitMs(
+        used: 0,
+        tokens: 101,
+        limit: 100,
+        hits: [],
+        now: $now
+    ) === null,
+    'Token overflow failed.'
+);
 
-$profile = Limit::profile(rpm: 60, tpm: 6_000, rpd: 1_000, options: ['dailyPercent' => 80]);
-check($profile->cooldownMs === 2_000 && $profile->dailyLimit === 800, 'Limit profile failed.');
-
-check(Budget::perRequest(tokens: 6_000, spacingMs: 1_000) === 100, 'Per request budget failed.');
-check(Budget::portion(100, 0.25) === 25, 'Budget portion failed.');
-
-$split = Budget::split(100, 100, [
-    ['name' => 'chat', 'target' => 0.5, 'max' => 0.7],
-    ['name' => 'embed', 'target' => 0.3, 'max' => 0.5],
+$store = new MemoryStore();
+$quota = new Quota([
+    'store' => $store,
+    'now' => static fn (): int => $now,
+    'id' => static fn (): string => 'hold-1',
 ]);
-check($split === ['chat' => 70, 'embed' => 30], 'Flexible budget split failed.');
+$key = ['id' => 'key-a', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500];
 
-$first = Cooldown::consume(null, actor: 'u1', sameMs: 1_000, diffMs: 2_000, now: $now);
-$second = Cooldown::consume($first->state, actor: 'u1', sameMs: 1_000, diffMs: 2_000, now: $now + 500);
-check($first->allowed && ! $second->allowed && $second->retryMs === 500, 'Cooldown failed.');
+$reserved = $quota->reserve('scope:1', $key, ['tokens' => 800]);
+check($reserved->ok && $reserved->hold !== null && $reserved->key === $key, 'Single key reserve failed.');
+check(! array_key_exists('reason', $reserved->toArray()), 'Allowed result shape failed.');
+check($quota->commit($reserved->hold, ['tokens' => 742]), 'Commit failed.');
+check($store->get('scope:1')['keys']['key-a']['hits'][0]['tokens'] === 742, 'Commit token update failed.');
 
-$memory = new MemoryCooldown(sameMs: 1_000, diffMs: 2_000);
-check($memory->consume('room:1', 'u1', $now)->allowed, 'Memory cooldown first consume failed.');
-check(! $memory->consume('room:1', 'u2', $now + 1_000)->allowed, 'Memory cooldown diff actor failed.');
-check($memory->size() === 1, 'Memory cooldown size failed.');
-$memory->reset('room:1');
-check($memory->size() === 0, 'Memory cooldown reset failed.');
-
-$tries = 0;
-$value = Retry::run(
-    task: function (int $attempt) use (&$tries): string {
-        $tries++;
-
-        if ($attempt === 0) {
-            throw new RuntimeException('Too many requests', 429);
-        }
-
-        return 'ok';
-    },
-    retries: 2
+$quota = new Quota(
+    store: new MemoryStore(),
+    now: static fn (): int => $now,
+    id: static fn (): string => 'hold-2',
 );
-check($value === 'ok' && $tries === 2, 'Retry run failed.');
+$keys = [
+    ['id' => 'key-a', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500, 'priority' => 5],
+    ['id' => 'key-b', 'rpm' => 15, 'tpm' => 250_000, 'rpd' => 500, 'priority' => 10],
+];
+$picked = $quota->check('scope:2', $keys, 1_500);
+check($picked->ok && $picked->key['id'] === 'key-b', 'Priority selection failed.');
+
+$store = new MemoryStore();
+$quota = new Quota(
+    store: $store,
+    now: static fn (): int => $now,
+    id: static fn (): string => 'hold-3',
+);
+$held = $quota->reserve('scope:3', ['id' => 'key-a', 'rpm' => 15, 'tpm' => 1_000, 'rpd' => 500], 800);
+check($held->ok && $held->hold !== null, 'Rollback reserve failed.');
+$blocked = $quota->check('scope:3', ['id' => 'key-a', 'rpm' => 15, 'tpm' => 1_000, 'rpd' => 500], 100);
+check(! $blocked->ok && $blocked->reason === 'rpm' && $blocked->waitMs === 5_000, 'RPM block failed.');
+check($quota->rollback($held->hold), 'Rollback failed.');
+check($store->get('scope:3')['keys']['key-a']['used'] === 0, 'Rollback usage restore failed.');
+
+$quota = new Quota(
+    now: static fn (): int => $now,
+    id: static fn (): string => 'hold-rpd',
+    thresholdPct: 100,
+);
+$dailyKey = ['id' => 'daily', 'rpm' => 999, 'tpm' => 999_999, 'rpd' => 1];
+check($quota->reserve('scope:4', $dailyKey, 1)->ok, 'RPD first reserve failed.');
+$rpdBlocked = $quota->check('scope:4', $dailyKey, 1);
+check(! $rpdBlocked->ok && $rpdBlocked->reason === 'rpd' && $rpdBlocked->waitMs > 0, 'RPD block failed.');
+
+$quota = new Quota(now: static fn (): int => $now);
+$tpmBlocked = $quota->check('scope:5', ['id' => 'tiny', 'rpm' => 999, 'tpm' => 10, 'rpd' => 999], 11);
+check(! $tpmBlocked->ok && $tpmBlocked->reason === 'tpm' && $tpmBlocked->waitMs === null, 'TPM hard block failed.');
+check($tpmBlocked->toArray()['reason'] === 'tpm', 'Blocked result shape failed.');
+
+$store = new MemoryStore();
+$store->set('scope:6', ['keys' => []]);
+check($store->size() === 1 && $store->get('scope:6') !== null, 'MemoryStore set/get failed.');
+$store->reset('scope:6');
+check($store->size() === 0, 'MemoryStore reset failed.');
+
+$manager = new QuotaManager(now: static fn (): int => $now);
+check($manager->check('scope:7', ['id' => 'alias', 'rpm' => 1, 'tpm' => 1, 'rpd' => 1], 1)->ok, 'QuotaManager alias failed.');
 
 echo "All tests passed.\n";

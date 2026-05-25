@@ -1,20 +1,19 @@
 {
     "name": "hikuroshi/rate-budget",
-    "description": "Provider-agnostic, storage-agnostic budget and rate limiting primitives for requests, tokens, quotas, cooldowns, and retries.",
+    "description": "A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.",
     "type": "library",
     "license": "MIT",
     "keywords": [
+        "multi-key",
         "rate-limit",
         "rate-limiter",
-        "rate-budget",
+        "rate-router",
         "quota",
-        "throttle",
-        "retry",
+        "quota-manager",
         "token-budget",
         "rpm",
         "tpm",
-        "rpd",
-        "cooldown"
+        "rpd"
     ],
     "homepage": "https://github.com/hikuroshi/rate-budget-php",
     "authors": [
@@ -33,7 +32,10 @@
     "autoload": {
         "psr-4": {
             "Hikuroshi\\RateBudget\\": "src/"
-        }
+        },
+        "files": [
+            "src/functions.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
@@ -50,6 +52,7 @@
     "archive": {
         "exclude": [
             "/tests",
+            "/reference",
             "/.github",
             "/.gitignore",
             "/composer.lock"

@@ -4,13 +4,11 @@ declare(strict_types=1);
 
 namespace Hikuroshi\RateBudget\Support;
 
-use DateTimeImmutable;
-use DateTimeInterface;
-use Throwable;
-
 /** @internal */
 final class Num
 {
+    private static int $idSeq = 0;
+
     public static function finite(mixed $value, int|float $fallback): int|float
     {
         if (is_int($value) || is_float($value)) {
@@ -42,11 +40,13 @@ final class Num
         return min(100.0, max(0.0, $safe));
     }
 
-    public static function ratio(mixed $value): float
+    public static function ratio(int|float $used, int|float $limit): float
     {
-        $safe = (float) self::finite($value, 0);
+        if ($limit <= 0) {
+            return 1.0;
+        }
 
-        return min(1.0, max(0.0, $safe));
+        return $used / $limit;
     }
 
     public static function nowMs(): int
@@ -54,28 +54,51 @@ final class Num
         return (int) floor(microtime(true) * 1000);
     }
 
-    public static function timeMs(DateTimeInterface|int|float|string|null $value): ?int
+    public static function dayKey(int $now): string
     {
-        if ($value === null) {
-            return null;
+        return gmdate('Y-m-d', intdiv($now, 1000));
+    }
+
+    public static function resetAt(int $now): int
+    {
+        $startOfDay = strtotime(self::dayKey($now) . ' 00:00:00 UTC');
+
+        return (int) (($startOfDay + 86_400) * 1000);
+    }
+
+    public static function id(): string
+    {
+        self::$idSeq = (self::$idSeq + 1) % PHP_INT_MAX;
+
+        return implode('-', [
+            base_convert((string) self::nowMs(), 10, 36),
+            base_convert((string) self::$idSeq, 10, 36),
+            str_pad(base_convert((string) random_int(0, 2_176_782_335), 10, 36), 6, '0', STR_PAD_LEFT),
+        ]);
+    }
+
+    public static function estimate(mixed $req): int
+    {
+        if (is_int($req) || is_float($req)) {
+            return self::nonNegative($req);
         }
 
-        if (is_int($value) || is_float($value)) {
-            return is_finite((float) $value) ? self::int($value) : null;
+        if (is_array($req) && array_key_exists('tokens', $req)) {
+            if (is_int($req['tokens']) || is_float($req['tokens'])) {
+                return self::nonNegative($req['tokens']);
+            }
+
+            return 1;
         }
 
-        if ($value instanceof DateTimeInterface) {
-            return intdiv((int) $value->format('Uu'), 1000);
+        if (is_object($req) && isset($req->tokens)) {
+            if (is_int($req->tokens) || is_float($req->tokens)) {
+                return self::nonNegative($req->tokens);
+            }
+
+            return 1;
         }
 
-        if (is_numeric($value)) {
-            return self::int((float) $value);
-        }
-
-        try {
-            return intdiv((int) (new DateTimeImmutable($value))->format('Uu'), 1000);
-        } catch (Throwable) {
-            return null;
-        }
+        return 1;
     }
 }

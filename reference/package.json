@@ -1,0 +1,47 @@
+{
+  "name": "rate-budget",
+  "version": "1.0.0",
+  "description": "A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.cjs",
+    "build": "node scripts/clean.cjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.cjs",
+    "test": "node scripts/clean.cjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.cjs && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "multi-key",
+    "quota",
+    "quota-manager",
+    "rate-limit",
+    "rate-router",
+    "rpm",
+    "tpm",
+    "rpd",
+    "token-budget"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
